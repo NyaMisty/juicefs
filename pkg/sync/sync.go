@@ -282,7 +282,7 @@ func listAll(store object.ObjectStorage, prefix, start, end string, followLink, 
 
 	objs, hasMore, nextToken, err := listOnce(store, prefix, marker, "", "", maxResults, followLink)
 	if errors.Is(err, utils.ErrNotSUP) {
-		return object.ListAllWithDelimiter(ctx, store, prefix, start, end, followLink)
+		return object.ListAllWithDelimiter(ctx, &observedStorage{store}, prefix, start, end, followLink)
 	}
 	if err != nil {
 		logger.Errorf("Can't list %s: %s", store, err.Error())
@@ -650,6 +650,20 @@ func observeListRequest(start time.Time, entries int) {
 	if listRequestHist != nil {
 		listRequestHist.Observe(time.Since(start).Seconds())
 	}
+}
+
+// observedStorage records the list metrics for object storage calls that
+// bypass listOnce, such as object.ListAllWithDelimiter which lists directly
+// on backends supporting only "/" as the delimiter.
+type observedStorage struct {
+	object.ObjectStorage
+}
+
+func (s *observedStorage) List(ctx context.Context, prefix, marker, token, delimiter string, limit int64, followLink bool) ([]object.Object, bool, string, error) {
+	start := time.Now()
+	objs, hasMore, nextToken, err := s.ObjectStorage.List(ctx, prefix, marker, token, delimiter, limit, followLink)
+	observeListRequest(start, len(objs))
+	return objs, hasMore, nextToken, err
 }
 
 func observeListGap(last time.Time) {
