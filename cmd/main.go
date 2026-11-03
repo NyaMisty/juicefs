@@ -329,7 +329,16 @@ func setup0(c *cli.Context, min, max int) {
 	}
 
 	if !c.Bool("no-agent") {
+		pprofAddr := c.String("pprof-addr")
 		go debugAgentOnce.Do(func() {
+			if pprofAddr != "" {
+				debugAgent = pprofAddr
+				logger.Infof("Debug agent listening on %s", debugAgent)
+				if err := http.ListenAndServe(debugAgent, nil); err != nil {
+					logger.Errorf("Debug agent failed to listen on %s: %s", debugAgent, err)
+				}
+				return
+			}
 			for port := 6060; port < 6100; port++ {
 				debugAgent = fmt.Sprintf("127.0.0.1:%d", port)
 				logger.Debugf("Debug agent listening on %s", debugAgent)
