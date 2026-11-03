@@ -334,7 +334,7 @@ func (f *fileWriter) Write(ctx meta.Context, off uint64, data []byte) syscall.Er
 	if f.w.usedBufferSize() > f.w.bufferSize {
 		// slow down
 		time.Sleep(time.Millisecond * 10)
-		for f.w.usedBufferSize() > f.w.bufferSize*2 {
+		for f.w.usedBufferSize() > f.w.bufferSizeHard {
 			time.Sleep(time.Millisecond * 100)
 		}
 	}
@@ -457,26 +457,35 @@ func (f *fileWriter) Truncate(length uint64) {
 
 type dataWriter struct {
 	sync.Mutex
-	m          meta.Meta
-	store      chunk.ChunkStore
-	conf       *Config
-	reader     DataReader
-	blockSize  int
-	bufferSize int64
-	files      map[Ino]*fileWriter
-	maxRetries uint32
+	m              meta.Meta
+	store          chunk.ChunkStore
+	conf           *Config
+	reader         DataReader
+	blockSize      int
+	bufferSize     int64
+	bufferSizeHard int64
+	files          map[Ino]*fileWriter
+	maxRetries     uint32
 }
 
 func NewDataWriter(conf *Config, m meta.Meta, store chunk.ChunkStore, reader DataReader) DataWriter {
+	bufferSize := int64(conf.Chunk.BufferSize)
+	bufferSizeHard := int64(conf.Chunk.BufferSizeHard)
+	if bufferSizeHard <= 0 {
+		bufferSizeHard = bufferSize * 2
+	} else if bufferSizeHard < bufferSize {
+		bufferSizeHard = bufferSize
+	}
 	w := &dataWriter{
-		m:          m,
-		store:      store,
-		reader:     reader,
-		conf:       conf,
-		blockSize:  conf.Chunk.BlockSize,
-		bufferSize: int64(conf.Chunk.BufferSize),
-		files:      make(map[Ino]*fileWriter),
-		maxRetries: uint32(conf.Meta.Retries),
+		m:              m,
+		store:          store,
+		reader:         reader,
+		conf:           conf,
+		blockSize:      conf.Chunk.BlockSize,
+		bufferSize:     bufferSize,
+		bufferSizeHard: bufferSizeHard,
+		files:          make(map[Ino]*fileWriter),
+		maxRetries:     uint32(conf.Meta.Retries),
 	}
 	go w.flushAll()
 	return w

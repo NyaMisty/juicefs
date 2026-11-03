@@ -310,6 +310,36 @@ func syncStorageFlags() []cli.Flag {
 			Value: object.AES256GCM_RSA,
 			Usage: "decrypt algorithm (aes256gcm-rsa, chacha20-rsa, sm4gcm)",
 		},
+		&cli.StringFlag{
+			Name:  "put-buffer-size",
+			Value: "1M",
+			Usage: "buffer size for each jfs Put request, e.g. 1M, 512K (env: JFS_PUT_BUFFER_SIZE)",
+		},
+		&cli.StringFlag{
+			Name:  "chunk-buffer-size",
+			Value: "1G",
+			Usage: "soft limit of the jfs write memory buffer, e.g. 1G (env: JFS_CHUNK_BUFFER_SIZE)",
+		},
+		&cli.StringFlag{
+			Name:  "chunk-buffer-hard-size",
+			Value: "2G",
+			Usage: "hard limit of the jfs write memory buffer, must be no less than chunk-buffer-size (env: JFS_CHUNK_BUFFER_HARD_SIZE)",
+		},
+		&cli.IntFlag{
+			Name:  "max-uploads",
+			Value: 64,
+			Usage: "maximum number of concurrent uploads for jfs (env: JFS_MAX_UPLOADS)",
+		},
+		&cli.IntFlag{
+			Name:  "max-downloads",
+			Value: 200,
+			Usage: "maximum number of concurrent downloads for jfs (env: JFS_MAX_DOWNLOADS)",
+		},
+		&cli.IntFlag{
+			Name:  "max-retries",
+			Value: 10,
+			Usage: "maximum number of retries for jfs (env: JFS_MAX_RETRIES)",
+		},
 	})
 }
 
@@ -521,8 +551,82 @@ func wrapSyncEncryptedStore(store object.ObjectStorage, keyPath, passphraseEnv, 
 	return object.NewChunkedEncrypted(store, encryptor), nil
 }
 
+func parseSyncBytes(key, value string) uint64 {
+	if strings.TrimSpace(value) == "" {
+		logger.Fatalf("Invalid empty value for %s", key)
+	}
+	if strings.HasPrefix(strings.TrimSpace(value), "-") {
+		logger.Fatalf("Invalid value %q for %s: must not be negative", value, key)
+	}
+	return utils.ParseBytesStr(key, value, 'M')
+}
+
+func syncTuningBytes(c *cli.Context, name, env string, def uint64) uint64 {
+	if c.IsSet(name) {
+		return parseSyncBytes(name, c.String(name))
+	}
+	if v := os.Getenv(env); v != "" {
+		return parseSyncBytes(env, v)
+	}
+	return def
+}
+
+func syncTuningInt(c *cli.Context, name, env string, def int) int {
+	if c.IsSet(name) {
+		return c.Int(name)
+	}
+	if v := os.Getenv(env); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			logger.Fatalf("Invalid value %q for %s: %s", v, env, err)
+		}
+		return n
+	}
+	return def
+}
+
+// applySyncJfsTuning resolves the jfs:// tuning for `juicefs sync` with the
+// priority CLI flags > environment variables > defaults. It has no effect on
+// other commands since only newJFS reads jfsTuning when it is active.
+func applySyncJfsTuning(c *cli.Context) error {
+	jfsTuning.active = true
+	jfsTuning.putBufferSize = syncTuningBytes(c, "put-buffer-size", "JFS_PUT_BUFFER_SIZE", defaultJfsPutBufferSize)
+	jfsTuning.chunkBufferSize = syncTuningBytes(c, "chunk-buffer-size", "JFS_CHUNK_BUFFER_SIZE", defaultJfsChunkBufferSize)
+	jfsTuning.chunkBufferHardSize = syncTuningBytes(c, "chunk-buffer-hard-size", "JFS_CHUNK_BUFFER_HARD_SIZE", defaultJfsChunkBufferHardSize)
+	jfsTuning.maxUploads = syncTuningInt(c, "max-uploads", "JFS_MAX_UPLOADS", defaultJfsMaxUploads)
+	jfsTuning.maxDownloads = syncTuningInt(c, "max-downloads", "JFS_MAX_DOWNLOADS", defaultJfsMaxDownloads)
+	jfsTuning.maxRetries = syncTuningInt(c, "max-retries", "JFS_MAX_RETRIES", defaultJfsMaxRetries)
+
+	if jfsTuning.putBufferSize == 0 {
+		return fmt.Errorf("--put-buffer-size must be greater than 0")
+	}
+	if jfsTuning.chunkBufferSize == 0 {
+		return fmt.Errorf("--chunk-buffer-size must be greater than 0")
+	}
+	if jfsTuning.chunkBufferHardSize == 0 {
+		return fmt.Errorf("--chunk-buffer-hard-size must be greater than 0")
+	}
+	if jfsTuning.chunkBufferHardSize < jfsTuning.chunkBufferSize {
+		return fmt.Errorf("--chunk-buffer-hard-size (%s) must be no less than --chunk-buffer-size (%s)",
+			utils.FormatBytes(jfsTuning.chunkBufferHardSize), utils.FormatBytes(jfsTuning.chunkBufferSize))
+	}
+	if jfsTuning.maxUploads <= 0 {
+		return fmt.Errorf("--max-uploads must be greater than 0")
+	}
+	if jfsTuning.maxDownloads <= 0 {
+		return fmt.Errorf("--max-downloads must be greater than 0")
+	}
+	if jfsTuning.maxRetries < 0 {
+		return fmt.Errorf("--max-retries must not be negative")
+	}
+	return nil
+}
+
 func doSync(c *cli.Context) error {
 	setup(c, 2)
+	if err := applySyncJfsTuning(c); err != nil {
+		return err
+	}
 	if c.IsSet("include") && !c.IsSet("exclude") {
 		logger.Warnf("The include option needs to be used with the exclude option, otherwise the result of the current sync may not match your expectations")
 	}

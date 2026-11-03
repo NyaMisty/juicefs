@@ -115,9 +115,45 @@ func (j *juiceFS) Get(rCtx context.Context, key string, off, limit int64, getter
 	return &jFile{f, limit}, nil
 }
 
+// Default tuning for the jfs:// backend used by `juicefs sync`.
+const (
+	defaultJfsPutBufferSize       = 1 << 20
+	defaultJfsChunkBufferSize     = 1 << 30
+	defaultJfsChunkBufferHardSize = 2 << 30
+	defaultJfsMaxUploads          = 64
+	defaultJfsMaxDownloads        = 200
+	defaultJfsMaxRetries          = 10
+)
+
+// jfsTuning is only activated by `juicefs sync`; its initial values keep the
+// upstream behavior for other commands.
+var jfsTuning = struct {
+	active              bool
+	putBufferSize       uint64
+	chunkBufferSize     uint64
+	chunkBufferHardSize uint64
+	maxUploads          int
+	maxDownloads        int
+	maxRetries          int
+}{
+	putBufferSize:       128 << 10,
+	chunkBufferSize:     300 << 20,
+	chunkBufferHardSize: 0,
+	maxUploads:          50,
+	maxDownloads:        200,
+	maxRetries:          10,
+}
+
+func jfsPutBufferSize() int {
+	if jfsTuning.putBufferSize == 0 {
+		return 128 << 10
+	}
+	return int(jfsTuning.putBufferSize)
+}
+
 var bufPool = sync.Pool{
 	New: func() interface{} {
-		buf := make([]byte, 128<<10)
+		buf := make([]byte, jfsPutBufferSize())
 		return &buf
 	},
 }
@@ -167,7 +203,13 @@ func (j *juiceFS) Put(rCtx context.Context, key string, in io.Reader, getters ..
 	if eno != 0 {
 		return toError(eno)
 	}
+	bufSize := jfsPutBufferSize()
 	buf := bufPool.Get().(*[]byte)
+	if cap(*buf) < bufSize {
+		*buf = make([]byte, bufSize)
+	} else {
+		*buf = (*buf)[:bufSize]
+	}
 	defer bufPool.Put(buf)
 	_, err = io.CopyBuffer(&jFile{f, 0}, in, *buf)
 	if err != nil {
@@ -499,6 +541,27 @@ func (j *juiceFS) Shutdown() {
 	_ = j.jfs.Meta().CloseSession()
 }
 
+func applyJfsTuning(conf *chunk.Config) {
+	if !jfsTuning.active {
+		return
+	}
+	conf.BufferSize = jfsTuning.chunkBufferSize
+	conf.BufferSizeHard = jfsTuning.chunkBufferHardSize
+	conf.MaxUpload = jfsTuning.maxUploads
+	conf.MaxDownload = jfsTuning.maxDownloads
+	conf.MaxRetries = jfsTuning.maxRetries
+	hard := conf.BufferSizeHard
+	if hard == 0 {
+		hard = conf.BufferSize * 2
+	} else if hard < conf.BufferSize {
+		logger.Warnf("chunk-buffer-hard-size %s is less than chunk-buffer-size %s, using 2x soft limit", utils.FormatBytes(hard), utils.FormatBytes(conf.BufferSize))
+		conf.BufferSizeHard = 0
+		hard = conf.BufferSize * 2
+	}
+	logger.Infof("jfs tuning for sync: put-buffer-size=%s, chunk-buffer-size=%s, chunk-buffer-hard-size=%s, max-uploads=%d, max-downloads=%d, max-retries=%d",
+		utils.FormatBytes(jfsTuning.putBufferSize), utils.FormatBytes(conf.BufferSize), utils.FormatBytes(hard), conf.MaxUpload, conf.MaxDownload, conf.MaxRetries)
+}
+
 func newJFS(endpoint, accessKey, secretKey, token string) (object.ObjectStorage, error) {
 	pid, uid, gid = uint32(os.Getpid()), uint32(utils.GetCurrentUID()), uint32(utils.GetCurrentGID())
 	if runtime.GOOS == "windows" && utils.IsWinAdminOrElevatedPrivilege() {
@@ -522,6 +585,7 @@ func newJFS(endpoint, accessKey, secretKey, token string) (object.ObjectStorage,
 		return nil, fmt.Errorf("object storage: %s", err)
 	}
 	chunkConf := getDefaultChunkConf(format)
+	applyJfsTuning(chunkConf)
 	store := chunk.NewCachedStore(blob, *chunkConf, nil)
 	registerMetaMsg(metaCli, store, chunkConf)
 	err = metaCli.NewSession(false)

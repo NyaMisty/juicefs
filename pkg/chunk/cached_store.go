@@ -555,6 +555,7 @@ type Config struct {
 	CacheFullBlock         bool
 	CacheLargeWrite        bool
 	BufferSize             uint64
+	BufferSizeHard         uint64 // 0 means 2x BufferSize
 	Readahead              int
 	Prefetch               int
 }
