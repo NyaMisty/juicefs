@@ -1083,7 +1083,25 @@ type holder struct {
 var muHolder sync.Mutex
 var holders []*holder
 
-func fetchTask(tasks chan object.Object) (t object.Object, done func()) {
+// largeFileHolderLimit returns the effective number of workers a single large
+// file may hold back. 0 disables the holders. The configured value is capped
+// by threads/8 (at least 1) so that a few large files cannot park most of the
+// workers on small thread counts.
+func (c *Config) largeFileHolderLimit() int {
+	if c == nil || c.LargeFileHolders <= 0 {
+		return 0
+	}
+	limit := c.LargeFileHolders
+	if byThreads := c.Threads / 8; byThreads < limit {
+		limit = byThreads
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	return limit
+}
+
+func fetchTask(tasks chan object.Object, holderLimit int) (t object.Object, done func()) {
 	muHolder.Lock()
 	defer muHolder.Unlock()
 	if len(holders) > 0 {
@@ -1109,10 +1127,10 @@ func fetchTask(tasks chan object.Object) (t object.Object, done func()) {
 	if size == markChecksum {
 		size = withoutSize(t).Size()
 	}
-	if size >= maxBlock*2 {
+	if holderLimit > 0 && size >= maxBlock*2 {
 		done := make(chan struct{})
 		h := &holder{done: done}
-		n := min(int(size)/maxBlock, 20)
+		n := min(int(size)/maxBlock, holderLimit)
 		for i := 1; i < n; i++ {
 			holders = append(holders, h)
 		}
@@ -1123,8 +1141,9 @@ func fetchTask(tasks chan object.Object) (t object.Object, done func()) {
 }
 
 func worker(tasks chan object.Object, src, dst object.ObjectStorage, config *Config, checkpointMgr *CheckpointManager, uploads multipartUploads) {
+	holderLimit := config.largeFileHolderLimit()
 	for {
-		obj, done := fetchTask(tasks)
+		obj, done := fetchTask(tasks, holderLimit)
 		if obj == nil {
 			break
 		}
@@ -2369,6 +2388,11 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 	}()
 
 	initSyncMetrics(config, bufferSize)
+	if config.LargeFileHolders <= 0 {
+		logger.Infof("Large file holders disabled, large files won't block other workers")
+	} else {
+		logger.Infof("Large file holders per large file: %d (configured: %d, threads: %d)", config.largeFileHolderLimit(), config.LargeFileHolders, config.Threads)
+	}
 	for i := 0; i < config.Threads; i++ {
 		wg.Add(1)
 		go func() {

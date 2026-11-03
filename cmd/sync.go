@@ -267,6 +267,11 @@ func syncStorageFlags() []cli.Flag {
 			Usage: "size of the task queue between lister and workers",
 		},
 		&cli.IntFlag{
+			Name:  "large-file-holders",
+			Value: 20,
+			Usage: "maximum number of workers held back by each large file (>= 20MB), 0 disables holders and never blocks other workers; effective value is capped to threads/8",
+		},
+		&cli.IntFlag{
 			Name:  "list-threads",
 			Value: 1,
 			Usage: "number of threads to list objects",

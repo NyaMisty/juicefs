@@ -38,6 +38,7 @@ type Config struct {
 	End               string
 	Threads           int
 	QueueSize         int
+	LargeFileHolders  int
 	Update            bool
 	ForceUpdate       bool
 	Perms             bool
@@ -186,6 +187,7 @@ func NewConfigFromCli(c *cli.Context) *Config {
 		End:                  c.String("end"),
 		Threads:              c.Int("threads"),
 		QueueSize:            c.Int("queue-size"),
+		LargeFileHolders:     c.Int("large-file-holders"),
 		ListThreads:          c.Int("list-threads"),
 		ListDepth:            c.Int("list-depth"),
 		Update:               c.Bool("update"),
@@ -244,6 +246,10 @@ func NewConfigFromCli(c *cli.Context) *Config {
 	if cfg.QueueSize <= 0 {
 		logger.Warnf("queue-size should be larger than 0, reset it to %d", DefaultQueueSize)
 		cfg.QueueSize = DefaultQueueSize
+	}
+	if cfg.LargeFileHolders < 0 {
+		logger.Warnf("large-file-holders should not be negative, disable it")
+		cfg.LargeFileHolders = 0
 	}
 	for _, key := range envList() {
 		if os.Getenv(key) != "" {
