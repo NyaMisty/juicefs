@@ -29,11 +29,15 @@ import (
 	"github.com/urfave/cli/v2"
 )
 
+// DefaultQueueSize is the default number of pending objects buffered between the lister and workers.
+const DefaultQueueSize = 10240
+
 type Config struct {
 	StorageClass      string
 	Start             string
 	End               string
 	Threads           int
+	QueueSize         int
 	Update            bool
 	ForceUpdate       bool
 	Perms             bool
@@ -181,6 +185,7 @@ func NewConfigFromCli(c *cli.Context) *Config {
 		Start:                c.String("start"),
 		End:                  c.String("end"),
 		Threads:              c.Int("threads"),
+		QueueSize:            c.Int("queue-size"),
 		ListThreads:          c.Int("list-threads"),
 		ListDepth:            c.Int("list-depth"),
 		Update:               c.Bool("update"),
@@ -235,6 +240,10 @@ func NewConfigFromCli(c *cli.Context) *Config {
 	if cfg.Threads <= 0 {
 		logger.Warnf("threads should be larger than 0, reset it to 1")
 		cfg.Threads = 1
+	}
+	if cfg.QueueSize <= 0 {
+		logger.Warnf("queue-size should be larger than 0, reset it to %d", DefaultQueueSize)
+		cfg.QueueSize = DefaultQueueSize
 	}
 	for _, key := range envList() {
 		if os.Getenv(key) != "" {

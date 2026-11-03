@@ -286,6 +286,8 @@ By default, `juicefs sync` starts 10 threads to run syncing jobs. You can set th
 
 If `Pending objects` in `juicefs sync` output remains 0, it means consumption is faster than production. You can increase `--list-threads` to enable concurrent `list` and then use `--list-depth` to control directory depth of `list`.
 
+Conversely, if `Pending objects` stays at the queue limit (10240 by default), consumption cannot keep up with production. Use `--queue-size` to change the queue length: a larger queue buffers more objects and uses more memory, while a smaller queue reduces memory usage.
+
 For example, if you are dealing with an object storage bucket used by JuiceFS, the directory structure is `/<vol-name>/chunks/xxx/xxx/...`. In this case, setting `--list-depth=2` enables concurrent listing on `<vol-name>/chunks`.
 
 ### Distributed synchronization {#distributed-sync}

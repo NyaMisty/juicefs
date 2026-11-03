@@ -262,6 +262,11 @@ func syncStorageFlags() []cli.Flag {
 			Usage:   "number of concurrent threads",
 		},
 		&cli.IntFlag{
+			Name:  "queue-size",
+			Value: sync.DefaultQueueSize,
+			Usage: "size of the task queue between lister and workers",
+		},
+		&cli.IntFlag{
 			Name:  "list-threads",
 			Value: 1,
 			Usage: "number of threads to list objects",

@@ -2116,7 +2116,10 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 		object.PutInplace = true
 	}
 
-	var bufferSize = 10240
+	bufferSize := config.QueueSize
+	if bufferSize <= 0 {
+		bufferSize = DefaultQueueSize
+	}
 	if config.Manager != "" {
 		// No support for work-stealing, so workers shouldnot buffer tasks to prevent piling up in their own queues, which could cause imbalance among workers.
 		bufferSize = 1

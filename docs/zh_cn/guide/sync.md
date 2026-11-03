@@ -296,6 +296,8 @@ juicefs sync ./empty-dir/ s3://mybucket.s3.us-east-2.amazonaws.com/ --match-full
 
 在 `juicefs sync` 命令的输出中，关注 `Pending objects` 的数量，如果该值持续为 0，说明消费速度大于生产，可以增大 `--list-threads` 来启用并发 `list`，以及用 `--list-depth` 来控制并发 `list` 的目录深度。
 
+反之，如果 `Pending objects` 持续停留在队列上限（默认 10240），说明消费速度跟不上生产，可以通过 `--queue-size` 调整队列长度：更大的队列能缓冲更多对象，但占用更多内存；更小的队列则更节省内存。
+
 比方说，如果你面对的是 JuiceFS 所使用的对象存储服务，那么目录结构为 `/<vol-name>/chunks/xxx/xxx/...`，对于这样的目录结构，使用 `--list-depth=2` 来实现对于 `/<vol-name>/chunks` 的并发列表操作，是比较合适的选择。
 
 ### 分布式同步 {#distributed-sync}
