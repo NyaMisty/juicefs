@@ -71,6 +71,16 @@ var (
 	concurrent              = make(chan int, 10)
 	limiter                 *mixedLimiter
 	totalHandled            atomic.Int64
+	// Prometheus metrics for diagnosing sync throughput; nil when metrics are disabled.
+	listRequestHist     *prometheus.Histogram
+	listGapHist         *prometheus.Histogram
+	copyDurationHist    *prometheus.HistogramVec
+	listEntries         atomic.Int64
+	workersWaitingQueue atomic.Int64
+	workersWaitingLarge atomic.Int64
+	workerWaitQueueNs   atomic.Int64
+	workerWaitLargeNs   atomic.Int64
+	producerBlockedNs   atomic.Int64
 )
 
 type mixedLimiter struct {
@@ -270,7 +280,7 @@ func listAll(store object.ObjectStorage, prefix, start, end string, followLink, 
 	marker := start
 	logger.Debugf("Listing objects from %s marker %q", store, marker)
 
-	objs, hasMore, nextToken, err := store.List(ctx, prefix, marker, "", "", maxResults, followLink)
+	objs, hasMore, nextToken, err := listOnce(store, prefix, marker, "", "", maxResults, followLink)
 	if errors.Is(err, utils.ErrNotSUP) {
 		return object.ListAllWithDelimiter(ctx, store, prefix, start, end, followLink)
 	}
@@ -307,14 +317,14 @@ func listAll(store object.ObjectStorage, prefix, start, end string, followLink, 
 			startTime = time.Now()
 			logger.Debugf("Continue listing objects from %s marker %q", store, marker)
 			var nextToken2 string
-			objs, hasMore, nextToken2, err = store.List(ctx, prefix, marker, nextToken, "", maxResults, followLink)
+			objs, hasMore, nextToken2, err = listOnce(store, prefix, marker, nextToken, "", maxResults, followLink)
 			count := 0
 			for err != nil && count < 3 {
 				logger.Warnf("Fail to list: %s, retry again", err.Error())
 				// slow down
 				time.Sleep(time.Millisecond * 100)
 
-				objs, hasMore, nextToken2, err = store.List(ctx, prefix, marker, nextToken, "", maxResults, followLink)
+				objs, hasMore, nextToken2, err = listOnce(store, prefix, marker, nextToken, "", maxResults, followLink)
 				count++
 			}
 			logger.Debugf("Found %d object from %s in %s", len(objs), store, time.Since(startTime))
@@ -626,6 +636,41 @@ var readInMem = map[string]struct{}{"mem": {}, "etcd": {}, "redis": {}, "tikv": 
 func inMap(obj object.ObjectStorage, m map[string]struct{}) bool {
 	_, ok := m[strings.Split(obj.String(), "://")[0]]
 	return ok
+}
+
+func listOnce(store object.ObjectStorage, prefix, marker, token, delimiter string, limit int64, followLink bool) ([]object.Object, bool, string, error) {
+	start := time.Now()
+	objs, hasMore, nextToken, err := store.List(ctx, prefix, marker, token, delimiter, limit, followLink)
+	observeListRequest(start, len(objs))
+	return objs, hasMore, nextToken, err
+}
+
+func observeListRequest(start time.Time, entries int) {
+	listEntries.Add(int64(entries))
+	if listRequestHist != nil {
+		listRequestHist.Observe(time.Since(start).Seconds())
+	}
+}
+
+func observeListGap(last time.Time) {
+	if listGapHist != nil {
+		listGapHist.Observe(time.Since(last).Seconds())
+	}
+}
+
+func observeCopyDuration(start time.Time, size int64) {
+	if copyDurationHist == nil {
+		return
+	}
+	bucket := "<1M"
+	if size >= 100<<20 {
+		bucket = ">=100M"
+	} else if size >= 10<<20 {
+		bucket = "10M-100M"
+	} else if size >= 1<<20 {
+		bucket = "1M-10M"
+	}
+	copyDurationHist.WithLabelValues(bucket).Observe(time.Since(start).Seconds())
 }
 
 func doCopySingle(src, dst object.ObjectStorage, key string, size int64, calChksum bool) (uint32, error) {
@@ -961,6 +1006,7 @@ func CopyData(src, dst object.ObjectStorage, key string, size int64, calChksum b
 
 func copyData(src, dst object.ObjectStorage, key string, size int64, mtime time.Time, calChksum bool, uploads multipartUploads) (uint32, error) {
 	start := time.Now()
+	defer observeCopyDuration(start, size)
 	var err error
 	var srcChksum uint32
 	if size <= multipartCheckpointThreshold {
@@ -1029,11 +1075,20 @@ func fetchTask(tasks chan object.Object) (t object.Object, done func()) {
 	if len(holders) > 0 {
 		h := holders[len(holders)-1]
 		holders = holders[:len(holders)-1]
+		workersWaitingLarge.Add(1)
+		waitStart := time.Now()
 		muHolder.Unlock()
 		<-h.done
 		muHolder.Lock()
+		workerWaitLargeNs.Add(time.Since(waitStart).Nanoseconds())
+		workersWaitingLarge.Add(-1)
 	}
-	if t = <-tasks; t == nil {
+	workersWaitingQueue.Add(1)
+	waitStart := time.Now()
+	t = <-tasks
+	workerWaitQueueNs.Add(time.Since(waitStart).Nanoseconds())
+	workersWaitingQueue.Add(-1)
+	if t == nil {
 		return nil, func() {}
 	}
 	size := t.Size()
@@ -1418,10 +1473,15 @@ func produce(tasks chan<- object.Object, srckeys, dstkeys <-chan object.Object, 
 		if checkpointMgr != nil {
 			checkpointMgr.AddPendingKey(prefix, obj)
 		}
+		start := time.Now()
 		tasks <- obj
+		producerBlockedNs.Add(time.Since(start).Nanoseconds())
 	}
 
+	lastListed := time.Now()
 	for obj := range srckeys {
+		observeListGap(lastListed)
+		lastListed = time.Now()
 		if obj == nil {
 			return fmt.Errorf("listing failed, stop syncing, waiting for pending ones")
 		}
@@ -1757,7 +1817,7 @@ func listCommonPrefix(store object.ObjectStorage, prefix string, cp chan object.
 		thisListMaxResults = math.MaxInt64
 	}
 	for {
-		objs, hasMore, nextToken, err = store.List(ctx, prefix, marker, nextToken, "/", thisListMaxResults, followLink)
+		objs, hasMore, nextToken, err = listOnce(store, prefix, marker, nextToken, "/", thisListMaxResults, followLink)
 		if err != nil {
 			return nil, err
 		}
@@ -2294,7 +2354,7 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 		}
 	}()
 
-	initSyncMetrics(config)
+	initSyncMetrics(config, bufferSize)
 	for i := 0; i < config.Threads; i++ {
 		wg.Add(1)
 		go func() {
@@ -2379,7 +2439,7 @@ func Sync(src, dst object.ObjectStorage, config *Config) error {
 	return syncExitFunc()
 }
 
-func initSyncMetrics(config *Config) {
+func initSyncMetrics(config *Config, queueSize int) {
 	if config.Registerer != nil {
 		config.Registerer.MustRegister(
 			prometheus.NewCounterFunc(prometheus.CounterOpts{
@@ -2448,6 +2508,58 @@ func initSyncMetrics(config *Config) {
 			}, func() float64 {
 				return float64(skippedBytes.Current())
 			}),
+		)
+		listRequestHist = prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "list_request_duration_seconds",
+			Help:    "Duration of storage List requests",
+			Buckets: []float64{0.001, 0.01, 0.1, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600},
+		})
+		listGapHist = prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "list_gap_seconds",
+			Help:    "Gap between consecutive objects received from the lister",
+			Buckets: []float64{0.001, 0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300},
+		})
+		copyDurationHist = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "copy_duration_seconds",
+			Help:    "Duration of copying an object, labeled by size bucket",
+			Buckets: []float64{0.001, 0.01, 0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600},
+		}, []string{"size"})
+		config.Registerer.MustRegister(
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "queue_capacity",
+				Help: "Capacity of the pending task queue",
+			}, func() float64 { return float64(queueSize) }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "workers_waiting_queue",
+				Help: "Workers blocked waiting for a task from the queue",
+			}, func() float64 { return float64(workersWaitingQueue.Load()) }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "workers_waiting_large",
+				Help: "Workers blocked waiting for a large object to finish",
+			}, func() float64 { return float64(workersWaitingLarge.Load()) }),
+			prometheus.NewCounterFunc(prometheus.CounterOpts{
+				Name: "worker_wait_queue_seconds_total",
+				Help: "Cumulative seconds workers spent waiting for tasks",
+			}, func() float64 { return float64(workerWaitQueueNs.Load()) / 1e9 }),
+			prometheus.NewCounterFunc(prometheus.CounterOpts{
+				Name: "worker_wait_large_seconds_total",
+				Help: "Cumulative seconds workers spent waiting for large objects",
+			}, func() float64 { return float64(workerWaitLargeNs.Load()) / 1e9 }),
+			prometheus.NewCounterFunc(prometheus.CounterOpts{
+				Name: "producer_blocked_seconds_total",
+				Help: "Cumulative seconds the producer spent blocked on a full task queue",
+			}, func() float64 { return float64(producerBlockedNs.Load()) / 1e9 }),
+			prometheus.NewCounterFunc(prometheus.CounterOpts{
+				Name: "list_entries_total",
+				Help: "Objects returned by storage List requests",
+			}, func() float64 { return float64(listEntries.Load()) }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "active_listers",
+				Help: "Active listing goroutines",
+			}, func() float64 { return float64(len(config.concurrentList)) }),
+			listRequestHist,
+			listGapHist,
+			copyDurationHist,
 		)
 		if failed != nil {
 			config.Registerer.MustRegister(prometheus.NewCounterFunc(prometheus.CounterOpts{
