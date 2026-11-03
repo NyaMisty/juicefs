@@ -72,8 +72,8 @@ var (
 	limiter                 *mixedLimiter
 	totalHandled            atomic.Int64
 	// Prometheus metrics for diagnosing sync throughput; nil when metrics are disabled.
-	listRequestHist     *prometheus.Histogram
-	listGapHist         *prometheus.Histogram
+	listRequestHist     prometheus.Histogram
+	listGapHist         prometheus.Histogram
 	copyDurationHist    *prometheus.HistogramVec
 	listEntries         atomic.Int64
 	workersWaitingQueue atomic.Int64
