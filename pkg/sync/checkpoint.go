@@ -735,13 +735,44 @@ func (m *CheckpointManager) ListPrefixes() []string {
 
 // RegisterChildPrefix registers a child prefix discovered during listing.
 func (m *CheckpointManager) RegisterChildPrefix(childPrefix string, listDepth int) {
+	m.setPrefixListDepth(childPrefix, listDepth)
+}
+
+// setPrefixListDepth sets the list depth of a prefix state, creating the state
+// if needed. It is also used to persist the root list depth, which is never
+// registered as a child prefix.
+func (m *CheckpointManager) setPrefixListDepth(prefix string, listDepth int) {
 	if m == nil {
 		return
 	}
-	state := m.GetOrCreatePrefixState(childPrefix)
+	state := m.GetOrCreatePrefixState(prefix)
 	state.Lock()
 	state.ListDepth = listDepth
 	state.Unlock()
+}
+
+// setResumeMarker sets both the last listed key and the list depth of a prefix
+// state, used to resume checkpoints written by the old single-producer lister.
+func (m *CheckpointManager) setResumeMarker(prefix, lastListedKey string, listDepth int) {
+	if m == nil {
+		return
+	}
+	state := m.GetOrCreatePrefixState(prefix)
+	state.Lock()
+	state.LastListedKey = lastListedKey
+	state.ListDepth = listDepth
+	state.Unlock()
+}
+
+// hasPrefix reports whether a prefix state already exists in the checkpoint.
+func (m *CheckpointManager) hasPrefix(prefix string) bool {
+	if m == nil {
+		return false
+	}
+	m.checkpoint.RLock()
+	_, ok := m.checkpoint.PrefixState[prefix]
+	m.checkpoint.RUnlock()
+	return ok
 }
 
 func (m *CheckpointManager) Stop() {

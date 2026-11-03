@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/juicedata/juicefs/pkg/utils"
 )
 
 func TestCheckpointManagerSaveAndLoad(t *testing.T) {
@@ -588,5 +589,192 @@ func TestCheckpointPlacedAtParentForFileDst(t *testing.T) {
 	wrongBaseKey := "subdir/target" + mgr.checkpointKey
 	if _, err := base.Head(ctx, wrongBaseKey); err == nil {
 		t.Errorf("checkpoint should NOT exist at wrong path %q", wrongBaseKey)
+	}
+}
+
+// initTestProgress initializes the package-level progress bars used by the
+// producer without starting a full Sync, so listing can be tested directly.
+// The returned progress must be closed with Done when the test finishes.
+func initTestProgress() *utils.Progress {
+	progress := utils.NewProgress(true)
+	handled = progress.AddCountBar("Scanned objects", 0)
+	excluded = progress.AddCountSpinner("Excluded objects")
+	excludedBytes = progress.AddByteSpinner("Excluded bytes")
+	skipped = progress.AddCountSpinner("Skipped objects")
+	skippedBytes = progress.AddByteSpinner("Skipped bytes")
+	extra = progress.AddCountSpinner("Extra objects")
+	extraBytes = progress.AddByteSpinner("Extra bytes")
+	return progress
+}
+
+// TestRestoreLegacyRootListDepth verifies that a checkpoint written by the old
+// single-producer lister (root ListDepth 0 and one global LastListedKey) is
+// resumed with the configured list depth and hierarchical listing, without
+// losing keys after the cursor or re-listing keys before it.
+func TestRestoreLegacyRootListDepth(t *testing.T) {
+	src, _ := object.CreateStorage("mem", "legacy-root-src", "", "", "")
+	dst, _ := object.CreateStorage("mem", "legacy-root-dst", "", "", "")
+	putObjects(t, src, "a/b/p", "a/b/q", "a/x", "a/y", "b/z", "c")
+
+	config := newTestConfig()
+	config.ListThreads = 4
+	config.ListDepth = 5
+	config.concurrentList = make(chan int, config.ListThreads)
+	progress := initTestProgress()
+	defer progress.Done()
+
+	pending := make(map[string]object.Object)
+	for _, key := range []string{"a/b/p", "a/x"} {
+		obj, err := src.Head(ctx, key)
+		if err != nil {
+			t.Fatalf("head %s: %v", key, err)
+		}
+		pending[key] = obj
+	}
+	mgr := NewCheckpointManager(src, dst, config)
+	mgr.checkpoint = &Checkpoint{
+		PrefixState: map[string]*PrefixState{
+			"": {
+				ListDone:      false,
+				LastListedKey: "a/x",
+				ListDepth:     0,
+				PendingKeys:   pending,
+				FailedKeys:    make(map[string]object.Object),
+			},
+		},
+		Config: config,
+	}
+
+	tasks := make(chan object.Object, 100)
+	if !restorePrefixFromCheckpoint(tasks, src, dst, "", config, mgr) {
+		t.Fatal("root prefix should be restored from the checkpoint")
+	}
+	close(tasks)
+
+	got := make(map[string]int)
+	for _, key := range collectTasks(tasks) {
+		got[key]++
+	}
+	// "a/b/q" was listed before the cursor and is not pending, so it must not
+	// be listed again; everything after the cursor must be restored exactly once.
+	want := map[string]int{"a/b/p": 1, "a/x": 1, "a/y": 1, "b/z": 1, "c": 1}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected restored keys: got %v, want %v", got, want)
+	}
+
+	mgr.checkpoint.RLock()
+	root := mgr.checkpoint.PrefixState[""]
+	aPrefix := mgr.checkpoint.PrefixState["a/"]
+	bPrefix := mgr.checkpoint.PrefixState["b/"]
+	mgr.checkpoint.RUnlock()
+	if root == nil || root.ListDepth != 5 {
+		t.Fatalf("root prefix state = %+v, want ListDepth 5", root)
+	}
+	if aPrefix == nil || aPrefix.ListDepth != 4 {
+		t.Fatalf("prefix a/ state = %+v, want ListDepth 4", aPrefix)
+	}
+	if bPrefix == nil || bPrefix.ListDepth != 4 {
+		t.Fatalf("prefix b/ state = %+v, want ListDepth 4", bPrefix)
+	}
+}
+
+// TestFreshRunPersistsRootListDepth verifies that a fresh hierarchical run
+// stores the configured list depth on the root prefix state.
+func TestFreshRunPersistsRootListDepth(t *testing.T) {
+	src, _ := object.CreateStorage("mem", "fresh-root-src", "", "", "")
+	dst, _ := object.CreateStorage("mem", "fresh-root-dst", "", "", "")
+	putObjects(t, src, "c", "dir/x")
+
+	config := newTestConfig()
+	config.ListThreads = 4
+	config.ListDepth = 5
+	config.concurrentList = make(chan int, config.ListThreads)
+	progress := initTestProgress()
+	defer progress.Done()
+
+	mgr := NewCheckpointManager(src, dst, config)
+	tasks := make(chan object.Object, 100)
+	if err := startProducer(tasks, src, dst, "", config.ListDepth, config, mgr); err != nil {
+		t.Fatalf("startProducer: %v", err)
+	}
+	close(tasks)
+
+	mgr.checkpoint.RLock()
+	root := mgr.checkpoint.PrefixState[""]
+	dir := mgr.checkpoint.PrefixState["dir/"]
+	mgr.checkpoint.RUnlock()
+	if root == nil || root.ListDepth != 5 {
+		t.Fatalf("root prefix state = %+v, want ListDepth 5", root)
+	}
+	if dir == nil || dir.ListDepth != 4 {
+		t.Fatalf("prefix dir/ state = %+v, want ListDepth 4", dir)
+	}
+	keys := collectTasks(tasks)
+	if len(keys) != 2 {
+		t.Fatalf("unexpected listed keys: %v", keys)
+	}
+}
+
+// TestRestoreLegacyRootListDepthDirectoryCursor verifies the conversion of a
+// legacy root cursor that points to a directory object, whose contents were
+// not listed yet.
+func TestRestoreLegacyRootListDepthDirectoryCursor(t *testing.T) {
+	src, _ := object.CreateStorage("mem", "legacy-dir-src", "", "", "")
+	dst, _ := object.CreateStorage("mem", "legacy-dir-dst", "", "", "")
+	putObjects(t, src, "c", "d/e/p", "d/e/q", "d/f", "g/h")
+
+	config := newTestConfig()
+	config.ListThreads = 4
+	config.ListDepth = 3
+	config.concurrentList = make(chan int, config.ListThreads)
+	progress := initTestProgress()
+	defer progress.Done()
+
+	pendingObj, err := src.Head(ctx, "c")
+	if err != nil {
+		t.Fatalf("head c: %v", err)
+	}
+	mgr := NewCheckpointManager(src, dst, config)
+	mgr.checkpoint = &Checkpoint{
+		PrefixState: map[string]*PrefixState{
+			"": {
+				ListDone:      false,
+				LastListedKey: "d/",
+				ListDepth:     0,
+				PendingKeys:   map[string]object.Object{"c": pendingObj},
+				FailedKeys:    make(map[string]object.Object),
+			},
+		},
+		Config: config,
+	}
+
+	tasks := make(chan object.Object, 100)
+	if !restorePrefixFromCheckpoint(tasks, src, dst, "", config, mgr) {
+		t.Fatal("root prefix should be restored from the checkpoint")
+	}
+	close(tasks)
+
+	got := make(map[string]int)
+	for _, key := range collectTasks(tasks) {
+		got[key]++
+	}
+	want := map[string]int{"c": 1, "d/e/p": 1, "d/e/q": 1, "d/f": 1, "g/h": 1}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected restored keys: got %v, want %v", got, want)
+	}
+
+	mgr.checkpoint.RLock()
+	root := mgr.checkpoint.PrefixState[""]
+	dPrefix := mgr.checkpoint.PrefixState["d/"]
+	gPrefix := mgr.checkpoint.PrefixState["g/"]
+	mgr.checkpoint.RUnlock()
+	if root == nil || root.ListDepth != 3 {
+		t.Fatalf("root prefix state = %+v, want ListDepth 3", root)
+	}
+	if dPrefix == nil || dPrefix.ListDepth != 2 {
+		t.Fatalf("prefix d/ state = %+v, want ListDepth 2", dPrefix)
+	}
+	if gPrefix == nil || gPrefix.ListDepth != 2 {
+		t.Fatalf("prefix g/ state = %+v, want ListDepth 2", gPrefix)
 	}
 }

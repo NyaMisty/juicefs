@@ -1885,6 +1885,64 @@ func listCommonPrefix(store object.ObjectStorage, prefix string, cp chan object.
 	return srckeys, nil
 }
 
+// startLegacyRootProducer resumes a checkpoint written by the old
+// single-producer lister, which stored one global cursor in the root prefix
+// state with ListDepth 0. The root and each ancestor directory of the cursor
+// are listed with the cursor as their start marker. The directory containing
+// the cursor is listed explicitly as well, because a delimited listing with
+// that marker would skip it. This covers every key after the cursor without
+// re-listing keys that were already emitted.
+func startLegacyRootProducer(tasks chan<- object.Object, src, dst object.ObjectStorage, config *Config, checkpointMgr *CheckpointManager) error {
+	lastKey := ""
+	if checkpointMgr != nil {
+		lastKey = checkpointMgr.GetLastListedKey("")
+	}
+	depth := config.ListDepth
+	prefixes := []string{""}
+	if lastKey != "" && depth > 0 {
+		comps := strings.Split(strings.TrimSuffix(lastKey, "/"), "/")
+		dirCount := len(comps) - 1
+		if strings.HasSuffix(lastKey, "/") {
+			dirCount = len(comps)
+		}
+		if dirCount > depth {
+			dirCount = depth
+		}
+		var prefix string
+		for i := 0; i < dirCount; i++ {
+			prefix += comps[i] + "/"
+			prefixes = append(prefixes, prefix)
+		}
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(prefixes))
+	for i, prefix := range prefixes {
+		listDepth := depth - i
+		if listDepth < 0 {
+			listDepth = 0
+		}
+		if prefix != "" && checkpointMgr.hasPrefix(prefix) {
+			// This ancestor is restored from its own checkpoint state.
+			continue
+		}
+		checkpointMgr.setResumeMarker(prefix, lastKey, listDepth)
+		wg.Add(1)
+		go func(prefix string, listDepth int) {
+			defer wg.Done()
+			if err := startProducer(tasks, src, dst, prefix, listDepth, config, checkpointMgr); err != nil {
+				errCh <- err
+			}
+		}(prefix, listDepth)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		return err
+	}
+	return nil
+}
+
 // restorePrefixFromCheckpoint restores the pending keys of a prefix from checkpoint and restarts the producer if the listing of the prefix is not done.
 // It returns true if the prefix is restored from checkpoint, otherwise false.
 func restorePrefixFromCheckpoint(tasks chan<- object.Object, src, dst object.ObjectStorage, prefix string, config *Config, checkpointMgr *CheckpointManager) bool {
@@ -1904,6 +1962,23 @@ func restorePrefixFromCheckpoint(tasks chan<- object.Object, src, dst object.Obj
 	}
 
 	if !listDone {
+		if prefix == "" && config.ListThreads > 1 && listDepth < config.ListDepth {
+			if listDepth <= 0 {
+				// Checkpoints written by the legacy single-producer lister kept
+				// only one global cursor in the root state (ListDepth 0).
+				// Convert it into hierarchical resume markers, otherwise the
+				// root would fall back to a single producer and the configured
+				// list concurrency would stay unused.
+				logger.Infof("Resuming checkpoint written by the single-producer lister with root list depth %d", config.ListDepth)
+				if err := startLegacyRootProducer(tasks, src, dst, config, checkpointMgr); err != nil {
+					logger.Errorf("Failed to restart producer for prefix %s: %v", prefix, err)
+					failed.Increment()
+				}
+				return true
+			}
+			listDepth = config.ListDepth
+			checkpointMgr.setPrefixListDepth(prefix, listDepth)
+		}
 		if err := startProducer(tasks, src, dst, prefix, listDepth, config, checkpointMgr); err != nil {
 			logger.Errorf("Failed to restart producer for prefix %s: %v", prefix, err)
 			failed.Increment()
@@ -2027,6 +2102,17 @@ func restoreFromCheckpoint(tasks chan<- object.Object, src, dst object.ObjectSto
 }
 
 func startProducer(tasks chan<- object.Object, src, dst object.ObjectStorage, prefix string, listDepth int, config *Config, checkpointMgr *CheckpointManager) error {
+	if checkpointMgr != nil && prefix == "" {
+		// Persist the root list depth. The root is not discovered through
+		// RegisterChildPrefix, and the single-producer fallback keeps one global
+		// cursor in the root state, which must not be mistaken for a
+		// hierarchical cursor on a later resume.
+		depth := listDepth
+		if config.ListThreads <= 1 {
+			depth = 0
+		}
+		checkpointMgr.setPrefixListDepth(prefix, depth)
+	}
 	config.concurrentList <- 1
 	defer func() {
 		<-config.concurrentList
