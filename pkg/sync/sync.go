@@ -1103,17 +1103,17 @@ func (c *Config) largeFileHolderLimit() int {
 
 func fetchTask(tasks chan object.Object, holderLimit int) (t object.Object, done func()) {
 	muHolder.Lock()
-	defer muHolder.Unlock()
 	if len(holders) > 0 {
 		h := holders[len(holders)-1]
 		holders = holders[:len(holders)-1]
+		muHolder.Unlock()
 		workersWaitingLarge.Add(1)
 		waitStart := time.Now()
-		muHolder.Unlock()
 		<-h.done
-		muHolder.Lock()
 		workerWaitLargeNs.Add(time.Since(waitStart).Nanoseconds())
 		workersWaitingLarge.Add(-1)
+	} else {
+		muHolder.Unlock()
 	}
 	workersWaitingQueue.Add(1)
 	waitStart := time.Now()
@@ -1131,8 +1131,12 @@ func fetchTask(tasks chan object.Object, holderLimit int) (t object.Object, done
 		done := make(chan struct{})
 		h := &holder{done: done}
 		n := min(int(size)/maxBlock, holderLimit)
-		for i := 1; i < n; i++ {
-			holders = append(holders, h)
+		if n > 1 {
+			muHolder.Lock()
+			for i := 1; i < n; i++ {
+				holders = append(holders, h)
+			}
+			muHolder.Unlock()
 		}
 		return t, func() { close(done) }
 	} else {
